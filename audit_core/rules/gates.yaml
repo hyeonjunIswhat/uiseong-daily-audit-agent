@@ -1,0 +1,53 @@
+# 정보화사업 계약 전 관문 정의 (관문 내비게이터 P1)
+#
+# 출처: 「의성군 생성형 AI 플랫폼 구축」(2026) 실제 진행 문서에서 역산한 실측 소요.
+# lead_weeks(소요)는 잠정 — 건별 편차 있음. 값 교체만으로 반영(코드 무수정).
+# 순서: 관문들은 공통 서류 완성 후 대부분 병행 가능. 착수마감 = 공고목표일 - lead_weeks.
+provisional: true
+source: 2026 생성형AI플랫폼 구축 실측 (docs/정보화사업_관문_가이드.md)
+
+gates:
+  task_review:
+    label: 과업심의위원회
+    basis: SW사업 계약·관리감독 지침 §25②·§26④
+    channel: 자체 위원회
+    lead_weeks: 1
+    requires: [과업심의요청서(별지9호), 사업계획서, 제안요청서, 산출내역서, 적정 사업기간 산정서]
+    output: 과업내용 종합 심의 결과서
+    post_duty: 과업 변경 시 재심의
+
+  pre_consult:
+    label: 정보화사업 사전협의
+    basis: 전자정부 성과관리 지침 (시군구 1억↑)
+    channel: 경북도 경유 → 행안부(IRM)
+    lead_weeks: 4
+    requires: [신청서(서식1), 자체검토결과서(서식2), 제안요청서, 산출내역서, 사업기간 산정서]
+    output: 사전협의 검토결과서
+    post_duty: 검토의견 반영
+
+  daily_audit:
+    label: 일상감사
+    basis: 의성군 자체감사 규칙 §22
+    channel: 기획예산과(감사)
+    lead_weeks: 1
+    requires: [일상감사요청서, 제안요청서, 산출내역서, 계약방법 검토서]
+    output: 일상감사 의견서·검토결과
+    post_duty: 의견 조치결과 통보 + RFP 반영
+
+  security_review:
+    label: 보안성검토
+    basis: 국가정보보안 기본지침 2장 2절
+    channel: 홍보과(정보통계팀) 경유
+    lead_weeks: 9
+    requires: [제안요청서, 정보통신망구성도, 자체보안대책, AI 체크리스트(해당 시)]
+    output: 보안성 검토결과 + 현장보안대책협의서
+    post_duty: 사업종료 후 1개월 내 이행결과 회신
+
+  procurement:
+    label: 조달청 구매협의
+    basis: 조달사업법 (협상에 의한 계약)
+    channel: 조달청
+    lead_weeks: 2
+    requires: [조달요청서, 제안요청서]
+    output: 구매협의 의견 → 의견반영서 회신
+    post_duty: 의견 공고 반영
