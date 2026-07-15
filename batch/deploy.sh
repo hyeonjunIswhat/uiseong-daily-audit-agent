@@ -23,16 +23,23 @@ sed 's/self.name = "일상감사 멀티 에이전트"/self.name = "일상감사 
 docker cp /tmp/daily_audit_pipe_legacy.py open-webui-pipelines:/app/pipelines/daily_audit_pipe.py
 docker cp pipelines/daily_audit_pipe.py open-webui:/app/backend/data/daily_audit/daily_audit_pipe.py
 
-echo "② Function 갱신 + ③ 스탬프"
+echo "② Function 갱신(콘텐츠+메타) + ③ 스탬프"
 docker cp functions/daily_audit_function.py open-webui:/tmp/daily_audit_function.py
 docker exec open-webui python -c "
-import sqlite3, time
+import json, re, sqlite3, time
 src = open('/tmp/daily_audit_function.py', encoding='utf-8').read()
+# 파일 머리말(frontmatter)에서 메타를 읽어 UI 소개·버전까지 동기화
+# (기존 결함: 콘텐츠만 갱신되어 모델 소개가 최초 등록값 0.1.0에 고정돼 있었음)
+fm = dict(re.findall(r'^(title|author|version|description): (.+)$', src.split('\"\"\"')[1], re.M))
 db = sqlite3.connect('/app/backend/data/webui.db')
-db.execute('UPDATE function SET content=?, updated_at=? WHERE id=?', (src, int(time.time()), 'daily_audit_agent'))
+meta = json.loads(db.execute(\"SELECT meta FROM function WHERE id='daily_audit_agent'\").fetchone()[0])
+meta['description'] = fm.get('description', meta.get('description', ''))
+meta.setdefault('manifest', {}).update(fm)
+db.execute('UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?',
+           (src, json.dumps(meta, ensure_ascii=False), int(time.time()), 'daily_audit_agent'))
 db.commit()
 open('/app/backend/data/daily_audit/DEPLOY_STAMP', 'w').write(str(time.time()))
-print('function+stamp OK')
+print('function+meta+stamp OK (v' + fm.get('version','?') + ')')
 "
 
 echo "④ pipelines 재기동"

@@ -1,9 +1,9 @@
 """
 title: 일상감사 멀티 에이전트
 author: 의성군 AI데이터팀
-version: 0.1.0
+version: 0.3.0
 required_open_webui_version: 0.9.0
-description: 일상감사 대상판정·자가점검·서면검토(의견서 초안). 진행 status·법령 인용 칩(citation) 지원 — Pipelines 버전의 in-app Function 이관본 (REBUILD 회차 1.5, UI_UX.md)
+description: 효규가영(効規可寧) — 일상감사 검토 멀티 에이전트. 파일(hwp·hwpx·xlsx·pdf) 첨부만으로 ① 자동 확인(대상판정·산식 검산·문서 간 대조·서류 완결성, 즉시) ② AI 통합 검토(1콜) ③ `검토` 시 감사팀용 의견서 초안(최대 3콜). 15초 근거 진행·부분 결과 선반환·개인정보 화면 마스킹. 절차 질문·법령 조회·사업유형 상담도 가능 (SPEC v0.3)
 """
 
 import asyncio
