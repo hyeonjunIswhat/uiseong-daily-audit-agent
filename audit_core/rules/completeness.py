@@ -125,14 +125,22 @@ class RequiredDocs:
         for name in filenames or []:
             base = re.sub(r"\.[A-Za-z0-9]+$", "", name).replace(" ", "")
             for key, spec in self.doc_types.items():
-                if key in hits:
-                    continue
                 for kw in spec.get("keywords", []):
-                    if kw.replace(" ", "") in base:
+                    if kw.replace(" ", "") not in base:
+                        continue
+                    prev = hits.get(key)
+                    if prev is None:
                         hits[key] = DocHit(
                             key, spec.get("label", key), f"파일명 '{name}'", weak=True
                         )
-                        break
+                    elif prev.weak and "첨부되지 않았습니다" in prev.source:
+                        # 본문 언급으로 '미첨부' 판정됐지만 실제로 그 파일이 첨부됨
+                        # (2026-07-15 실장애: 첨부한 제안요청서를 미첨부로 안내)
+                        hits[key] = DocHit(
+                            key, prev.label,
+                            f"파일명 '{name}' 첨부 확인(본문 표제는 미확인)", weak=True,
+                        )
+                    break
         return list(hits.values())
 
     # ── 필수서류 산정 ──────────────────────────────────────

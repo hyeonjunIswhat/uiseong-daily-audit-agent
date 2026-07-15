@@ -91,60 +91,86 @@ class AxisReviewer:
         return AxisResult(axis=axis["axis"], items=merged)
 
     def review_all(self, axes: list[dict], doc_text: str, law_context: str = "",
-                   should_stop=None) -> list[AxisResult]:
-        """활성 축 전체를 **한 번의 구조화 호출**로 검토(2026-07-15 처리시간 개선).
+                   should_stop=None, progress=None,
+                   law_blocks: dict[str, str] | None = None) -> list[AxisResult]:
+        """활성 축 전체를 **항목 묶음(기본 12개) 단위 구조화 호출**로 검토.
 
-        기존: 축마다 호출 → 같은 본문을 N번 전송. 개선: 항목 전체를 1콜.
-        축별 결과 스키마(AxisResult)와 항목 추적성은 회신을 재그룹해 유지한다.
-        긴 문서는 조각 순차 호출 후 항목 병합(기존 doc_sectioner 의미론).
-        should_stop()이 참이 되면 남은 조각을 중단하고 지금까지 결과로 병합한다.
+        v1(축별 N콜) → v2(전 항목 1콜, 2026-07-15 오전) → v3(항목 배치, 같은 날
+        실장애 반영): 34개 항목+법령 전체를 한 콜에 실으면 모델이 일부만 답하거나
+        장시간 무응답이고, 실패가 전 항목 미회신으로 번진다. 배치 분할로 —
+          · 호출당 출력이 짧아 응답이 빠르고 안정적
+          · 법령 발췌는 그 배치 항목이 인용한 조문만 첨부(전체 중복 투입 금지)
+          · 한 배치가 실패해도 다른 배치 판정은 살아남는다(부분 결과)
+        축별 결과 스키마·항목 추적성은 회신 재그룹으로 유지. progress 콜백이
+        있으면 배치마다 실제 진행(항목 수·후보 수)을 보고한다(15초 알림 다양화).
         """
         item_axis = {it["item_id"]: a["axis"] for a in axes for it in a["items"]}
-        listing = []
-        for a in axes:
-            listing.append(f"[축 {a['axis']}. {a['title']}]")
-            for it in a["items"]:
-                refs = f" (관련법령 {', '.join(it['law_refs'])})" if it.get("law_refs") else ""
-                listing.append(f"- {it['item_id']}: {it['question']}{refs}")
-        items_txt = "\n".join(listing)
-        law_block = f"\n[관련 법령 발췌]\n{law_context}\n" if law_context else ""
+        axis_title = {a["axis"]: a["title"] for a in axes}
+        flat = [(a["axis"], it) for a in axes for it in a["items"]]
+        max_items = getattr(get_settings(), "AUDIT_REVIEW_MAX_ITEMS", 12)
+        batches = [flat[i:i + max_items] for i in range(0, len(flat), max_items)] or [[]]
 
-        # 전 항목 회신 강제(2026-07-15 실측 개선): 통합 1콜에서 모델이 일부
-        # 항목만 내고 멈추는 현상(650자 회신 → 대부분 '판정 미회신') → 스키마에
-        # minItems를 동적으로 걸어 제약 디코딩·검증 재시도(1회)가 전 항목을 요구.
         from pydantic import Field, create_model
-        n_items = len(item_axis)
-        BatchSchema = create_model(
-            "AxisResult",  # 이름 유지 — 테스트 페이크가 schema.__name__으로 분기
-            axis=(str, ...),
-            items=(list[AxisItemResult], Field(min_length=n_items)),
-        )
 
-        def one(chunk: str, tag: str) -> list[AxisItemResult]:
+        def listing_for(batch):
+            lines, cur_axis = [], None
+            refs_used: set[str] = set()
+            for axis, it in batch:
+                if axis != cur_axis:
+                    lines.append(f"[축 {axis}. {axis_title[axis]}]")
+                    cur_axis = axis
+                refs = f" (관련법령 {', '.join(it['law_refs'])})" if it.get("law_refs") else ""
+                refs_used.update(it.get("law_refs") or [])
+                lines.append(f"- {it['item_id']}: {it['question']}{refs}")
+            return "\n".join(lines), refs_used
+
+        def law_for(refs_used: set[str]) -> str:
+            if law_blocks is not None:  # 배치 항목이 인용한 조문만 첨부
+                picked = [law_blocks[r] for r in sorted(refs_used) if r in law_blocks]
+                return ("\n[관련 법령 발췌]\n" + "\n\n".join(picked) + "\n") if picked else ""
+            return f"\n[관련 법령 발췌]\n{law_context}\n" if law_context else ""
+
+        def one(chunk: str, tag: str, batch, k: int) -> list[AxisItemResult]:
+            items_txt, refs_used = listing_for(batch)
+            n = len(batch)
+            schema = create_model(
+                "AxisResult",  # 이름 유지 — 테스트 페이크가 schema.__name__으로 분기
+                axis=(str, ...),
+                items=(list[AxisItemResult], Field(min_length=n)),
+            )
             prompt = (f"[점검항목 — 축별로 묶여 있음, 전 항목 판정 필수]\n{items_txt}\n"
-                      f"{law_block}\n[문서{tag}]\n{chunk}\n\n"
-                      f"위 점검항목 {n_items}개 **전부**에 대해 items에 하나씩 판정을 "
-                      f"넣어라(총 {n_items}개 — 빠뜨린 항목은 오답 처리). "
+                      f"{law_for(refs_used)}\n[문서{tag}]\n{chunk}\n\n"
+                      f"위 점검항목 {n}개 **전부**에 대해 items에 하나씩 판정을 "
+                      f"넣어라(총 {n}개 — 빠뜨린 항목은 오답 처리). "
                       f"item_id는 반드시 위 목록의 것을 그대로 사용한다. "
                       f"문서에 관련 내용이 없으면 verdict를 UNABLE로 한다.")
             try:
                 r = self.client.chat_json(model=self.model, system=SYSTEM, prompt=prompt,
-                                          schema=BatchSchema, num_predict=4096,
+                                          schema=schema, num_predict=2048,
                                           stage="review",
                                           timeout_s=get_settings().AUDIT_TIMEOUT_REVIEW_S)
-                return [it for it in r.items if it.item_id in item_axis]
-            except (SchemaValidationError, LLMUnavailable):
-                # 타임아웃·장애는 재시도하지 않는다(성능 규율) — 이 조각의 항목은
-                # 병합 단계에서 UNABLE('판정 미회신')로 남아 부분 결과로 반환된다.
+                got = [it for it in r.items if it.item_id in item_axis]
+                if progress:
+                    n_f = sum(1 for it in got if it.verdict == "FLAG")
+                    progress(f"🔍 항목 묶음 {k}/{len(batches)}({len(got)}개) 판정을 받았습니다"
+                             + (f" — 의견 후보 {n_f}건" if n_f else " — 후보 없음"))
+                return got
+            except (SchemaValidationError, LLMUnavailable) as e:
+                # 타임아웃·장애는 재시도하지 않는다 — 이 배치의 항목만 UNABLE
+                # ('판정 미회신')로 남고 다른 배치 판정은 유지된다(부분 결과).
+                if progress:
+                    progress(f"⚠ 항목 묶음 {k}/{len(batches)} 판정 실패({type(e).__name__}) — "
+                             f"{len(batch)}개 항목은 '확인 필요'로 남기고 계속합니다")
                 return []
 
         chunks = self._split_chunks(doc_text) if len(doc_text) > self.CHUNK_CHARS else [doc_text]
         per_chunk: list[list[AxisItemResult]] = []
         for i, c in enumerate(chunks, 1):
-            if should_stop and should_stop():
-                break
             tag = f" 조각 {i}/{len(chunks)} — 전체의 일부" if len(chunks) > 1 else ""
-            per_chunk.append(one(c, tag))
+            for k, b in enumerate(batches, 1):
+                if should_stop and should_stop():
+                    break
+                per_chunk.append(one(c, tag, b, k))
 
         # 항목 병합(OK>FLAG>UNABLE>NA — 조각 의미론과 동일) 후 축별 재그룹
         rank = {"OK": 3, "FLAG": 2, "UNABLE": 1, "NA": 0}

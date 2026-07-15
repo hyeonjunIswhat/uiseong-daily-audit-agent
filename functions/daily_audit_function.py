@@ -247,6 +247,7 @@ class Pipe:
         # ── 1차 즉시 사전점검(LLM 미관여) — 파일을 읽는 족족 실제 근거를 내보낸다
         # ("파일을 확인했습니다" 같은 추상 문구 금지 — 파일명·글자수·검산 결과로 말한다)
         filenames, cost_lines, extra_parts, skipped, attach_texts = [], [], [], [], []
+        bundle_profiles = []            # 파일별 사업 프로파일(첨부 시에만 채움)
         prep_evidence: list[str] = []   # 15초 안내용 '마지막 확인 근거'
         if files:
             paths = _attachment_paths(files)
@@ -267,6 +268,27 @@ class Pipe:
                                                    f"사업비\n금{int(r['total'].claimed):,}원"))
                 else:
                     skipped.append(r["note"])
+            # 파일별 독립 프로파일 → 사업 묶음 판정(결정론). 서로 다른 사업이
+            # 섞여 있으면 검토를 시작하지 않는다(실장애 2026-07-15: 스카이디펜스런
+            # 용역 + GPU 물품이 한 검토로 합쳐져 전부 '용역·협상'으로 오분류).
+            if attach_texts:
+                from audit_core.rules.bundle import (
+                    format_split_report, group_projects, profile_file,
+                )
+                text_names = {n for n, _t in attach_texts}
+                profs = [await asyncio.to_thread(profile_file, n, t) for n, t in attach_texts]
+                profs += [profile_file(n, "") for n in filenames if n not in text_names]
+                groups = group_projects(profs)
+                if len(groups) > 1:
+                    named = [next((p.biz_name for p in g if p.biz_name), "미상") for g in groups]
+                    _agent_log(f"⛔ 사업 혼합 감지 — 묶음 {len(groups)}개({len(profs)}파일) → 검토 미시작")
+                    yield "\n" + mask_pii(format_split_report(groups))
+                    return
+                bundle_profiles = groups[0]
+                for p in profs:
+                    if p.biz_name:
+                        yield mask_pii(f"🏷️ [원문 확인] `{p.name}` — 사업명 「{p.biz_name}」 ({p.biz_name_src})") + "\n"
+                        break
             if attach_texts:
                 attach_doc = "\n\n".join(f"[문서: {n}]\n{t}" for n, t in attach_texts)
                 doc = (doc + "\n\n" + attach_doc).strip() if doc else attach_doc
@@ -292,8 +314,17 @@ class Pipe:
             return
 
         profile = detect_doc_type(doc)
-        # 사업성격 해석(현실 표현→법정 유형) 우선 — 라벨 없는 실문서 대응(2026-07-15)
-        bp, biz_type = await asyncio.to_thread(legacy._classify_biz, doc, True)
+        # 사업성격 해석 — 병합 텍스트가 아니라 **대표 문서**(요청서 우선, 없으면 최장
+        # 텍스트) 기준으로 분류한다(2026-07-15 실장애: 첫 문서가 병합의 79%를 차지해
+        # 다른 파일들의 유형을 지배). 붙여넣기 단일 본문은 기존대로 전체 분류.
+        cls_src = doc
+        if bundle_profiles:
+            rep = max((p for p in bundle_profiles if p.text),
+                      key=lambda p: ("요청서" in p.name or "의뢰서" in p.name, len(p.text)),
+                      default=None)
+            if rep is not None:
+                cls_src = rep.text
+        bp, biz_type = await asyncio.to_thread(legacy._classify_biz, cls_src, True)
         group = rubric_group(biz_type)
         method = (bp.contract_method if bp.contract_method != "미상" else None) or legacy._detect_method(doc)
 

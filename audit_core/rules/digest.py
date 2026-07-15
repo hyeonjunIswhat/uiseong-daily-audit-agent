@@ -39,10 +39,30 @@ def _signals() -> list[str]:
 
 
 def build_review_digest(doc_text: str, cap: int | None = None) -> str:
-    """검토용 발췌 — cap 이하면 원문 그대로(정확도 우선), 초과 시 결정론 발췌."""
+    """검토용 발췌 — cap 이하면 원문 그대로(정확도 우선), 초과 시 결정론 발췌.
+
+    다문서 번들은 `[문서:]` 경계로 나눠 **문서별로 cap을 균등 배분**한다
+    (2026-07-15 실장애: 첫 문서가 병합의 79%를 차지해 전역 cap 8,000자가
+    사실상 첫 문서만 남기고 뒤 문서들을 지워버림).
+    """
     cap = cap or get_settings().AUDIT_DIGEST_CAP
     if len(doc_text) <= cap:
         return doc_text
+
+    # 다문서면 문서별 몫으로 재귀 — 각 문서가 최소 지분을 보장받는다
+    segs: list[str] = []
+    cur: list[str] = []
+    for ln in doc_text.splitlines():
+        if _DOC_MARKER.match(ln.strip()) and cur:
+            segs.append("\n".join(cur))
+            cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        segs.append("\n".join(cur))
+    if len(segs) > 1:
+        share = max(1500, cap // len(segs))
+        return "\n".join(build_review_digest(seg, cap=share) for seg in segs)
 
     signals = _signals()
     lines = doc_text.splitlines()

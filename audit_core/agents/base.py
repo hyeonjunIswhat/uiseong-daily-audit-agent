@@ -166,10 +166,17 @@ class OllamaClient:
         }
 
         req_id, t0, status, out_chars = uuid.uuid4().hex[:8], time.time(), "error", 0
+        # 월클럭 데드라인(2026-07-15 실장애: 소켓 타임아웃 90초인데 think 재시도·
+        # 스키마 재시도가 겹쳐 한 호출이 2분+ 지속) — 재시도를 포함한 총 시간이
+        # timeout_s를 넘지 않는다. 남은 예산이 10초 미만이면 재시도하지 않는다.
+        deadline = t0 + (timeout_s or self.timeout_s)
         last_err: Exception | None = None
         try:
             for _attempt in range(2):
-                resp = self._chat(payload, timeout_s)
+                remain = deadline - time.time()
+                if _attempt > 0 and remain < 10:
+                    break  # 재시도 예산 부족 — 재전송하지 않고 부분 결과 우선
+                resp = self._chat(payload, max(1, int(remain)))
                 content = (resp.get("message") or {}).get("content", "")
                 out_chars = len(content)
                 try:

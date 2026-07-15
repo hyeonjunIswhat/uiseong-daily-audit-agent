@@ -39,7 +39,16 @@ db.execute('UPDATE function SET content=?, meta=?, updated_at=? WHERE id=?',
            (src, json.dumps(meta, ensure_ascii=False), int(time.time()), 'daily_audit_agent'))
 db.commit()
 open('/app/backend/data/daily_audit/DEPLOY_STAMP', 'w').write(str(time.time()))
-print('function+meta+stamp OK (v' + fm.get('version','?') + ')')
+# OWUI 자체 파일 RAG(중복 임베딩·등급1 벡터 사본) 차단 — 첨부는 Function이 직접 처리
+row = db.execute(\"SELECT meta FROM model WHERE id='daily_audit_agent'\").fetchone()
+if row:
+    mm = json.loads(row[0] or '{}')
+    caps = mm.get('capabilities') or {}
+    if caps.get('file_context') is not False:
+        caps['file_context'] = False; mm['capabilities'] = caps
+        db.execute(\"UPDATE model SET meta=? WHERE id='daily_audit_agent'\", (json.dumps(mm, ensure_ascii=False),))
+        db.commit()
+print('function+meta+stamp OK (v' + fm.get('version','?') + ', file_context=off)')
 "
 
 echo "④ pipelines 재기동"

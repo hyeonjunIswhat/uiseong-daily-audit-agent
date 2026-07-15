@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     AUDIT_TIMEOUT_SYNTH_S: int = 90
     # 검토 입력 다이제스트 상한(자) — 초과분은 결정론 발췌(digest.py)로 축약
     AUDIT_DIGEST_CAP: int = 8000
+    # 검토 호출 1건당 최대 점검항목 수 — 34항목+전체 법령 단일 콜의 무응답·부분
+    # 회신 실장애(2026-07-15) 대응. 배치별로 인용 조문만 첨부, 실패는 배치 격리.
+    AUDIT_REVIEW_MAX_ITEMS: int = 12
 
     # ── 문서 파서 (kordoc) ───────────────────────
     KORDOC_PARSE_URL: str = "http://host.docker.internal:8001/parse_document"

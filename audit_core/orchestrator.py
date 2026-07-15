@@ -135,12 +135,15 @@ class Orchestrator:
                      f"({', '.join(a['axis'] for a in skipped)}축) — 문서에 관련 신호 없음")
         return keep, skipped
 
-    def _law_context(self, refs: list[str], progress: ProgressFn) -> tuple[str, list[str]]:
-        blocks, used = [], []
+    def _law_context(self, refs: list[str], progress: ProgressFn) -> tuple[str, list[str], dict[str, str]]:
+        """조문 확보 → (전체 발췌 문자열, 실존 refs, ref→발췌 사전).
+        사전은 배치 검토가 '그 배치 항목이 인용한 조문만' 골라 싣는 데 쓴다."""
+        blocks: dict[str, str] = {}
+        used: list[str] = []
         for ref in refs:
             try:
                 art = self.law.fetch_ref(ref)
-                blocks.append(f"[{ref}] {art.law_name} {art.article}\n{art.text}")
+                blocks[ref] = f"[{ref}] {art.law_name} {art.article}\n{art.text}"
                 used.append(ref)
             except Exception:
                 continue
@@ -148,7 +151,7 @@ class Orchestrator:
             progress(f"📚 관련 법령 {len(used)}건의 원문을 확보했습니다")
         elif refs:
             progress("📚 법령 원문을 가져오지 못했습니다(캐시 없음·OC 미설정) — 발췌 없이 검토를 계속합니다")
-        return "\n\n".join(blocks), used
+        return "\n\n".join(blocks.values()), used, blocks
 
     def self_check(
         self,
@@ -241,20 +244,34 @@ class Orchestrator:
         if len(llm_doc) < len(llm_doc_text or doc_text):
             progress(f"✂️ 긴 문서라 금액·산식·표제 중심으로 발췌해 검토합니다"
                      f"(원문 {len(llm_doc_text or doc_text):,}자 → 발췌 {len(llm_doc):,}자)")
-        titles = " · ".join(a["title"] for a in axes)
-        progress(f"🔍 검토 에이전트가 {len(axes)}개 축({titles[:60]}…)을 한 번에 살펴보고 있습니다…"
-                 if len(titles) > 60 else
-                 f"🔍 검토 에이전트가 {len(axes)}개 축({titles})을 한 번에 살펴보고 있습니다…")
+        # 법령을 먼저 확보하고 검토 안내를 뒤에 — 긴 판정 대기 중 15초 알림의
+        # '지금' 항목이 '법령 확보'가 아니라 실제 진행(검토 배치)을 가리키게 한다.
         refs = self.rubric.all_law_refs(axes)
-        law_ctx, used = self._law_context(refs, progress)
+        law_ctx, used, law_blocks = self._law_context(refs, progress)
         report.law_context_used.extend(used)
-        results = self.reviewer.review_all(axes, llm_doc, law_ctx, should_stop=should_stop)
+        n_items_total = sum(len(a["items"]) for a in axes)
+        titles = " · ".join(a["title"] for a in axes)
+        progress(f"🔍 검토 에이전트가 {len(axes)}개 축 {n_items_total}개 항목"
+                 f"({titles[:50]}…)을 묶음 단위로 판정받고 있습니다…")
+        results = self.reviewer.review_all(axes, llm_doc, should_stop=should_stop,
+                                           progress=progress, law_blocks=law_blocks)
         for i, result in enumerate(results, 1):
             report.axis_results.append(result)
             axis = axes[i - 1]
             n_flag = sum(1 for it in result.items if it.verdict == "FLAG")
-            progress(f"🔍 '{axis['title']}' 검토를 마쳤습니다 ({i}/{len(axes)}) — "
-                     + ("이상 없습니다 ✓" if n_flag == 0 else f"검토 의견 후보 {n_flag}건 🚩"))
+            n_unable = sum(1 for it in result.items if it.verdict == "UNABLE")
+            n_ok = sum(1 for it in result.items if it.verdict == "OK")
+            # 정직 원칙(2026-07-15 실장애): FLAG 0 ≠ 이상 없음. 판정을 못 받았거나
+            # 근거가 없으면 그대로 말한다 — '이상 없음'은 OK 판정이 있을 때만.
+            if n_flag:
+                verdict_msg = f"검토 의견 후보 {n_flag}건 🚩"
+            elif n_ok == 0:
+                verdict_msg = f"판단할 근거를 찾지 못했습니다(확인 필요 {n_unable}건)"
+            elif n_unable:
+                verdict_msg = f"이상 없음 {n_ok}건 · 확인 필요 {n_unable}건"
+            else:
+                verdict_msg = "이상 없습니다 ✓"
+            progress(f"🔍 '{axis['title']}' 검토를 마쳤습니다 ({i}/{len(axes)}) — {verdict_msg}")
             for it in result.items:  # 발견 위치·문항 즉시 보고("여기서 찾았습니다")
                 if it.verdict == "FLAG":
                     progress(f"   ↳ [{it.item_id}] 여기서 찾았습니다 — {it.evidence[:80]}")
@@ -500,13 +517,25 @@ def format_self_check(report: ReviewReport) -> str:
     if unable:
         total_items = sum(len(ar.items) for ar in report.axis_results)
         lines.append(f"### ❔ 판단 불가 {len(unable)}건 (담당자 확인 필요)")
-        # 대부분이 판단 불가면 나열 대신 원인 요약(제출 서류 부족·문서 불일치가 원인)
-        if total_items and len(unable) >= max(8, int(total_items * 0.7)):
+        # 원인을 구분해 설명한다(2026-07-15 실장애: 모델 실행 실패를 '서류 부족'
+        # 처럼 안내하던 결함) — 미회신(시간 제한·모델 실패)은 서류 문제가 아니다.
+        no_reply = [(a, it) for a, it in unable if it.evidence.startswith("판정 미회신")]
+        judged = len(unable) - len(no_reply)
+        if no_reply:
             lines.append(
-                f"> 점검 항목 {total_items}개 중 {len(unable)}개를 이 문서만으로는 판단할 수 "
-                f"없었습니다. 대개 **문서가 검토 대상 서류가 아니거나, 판단에 필요한 서류"
-                f"(산출내역서·사업계획서 등)가 빠진 경우**입니다 — 위 '서류 완결성 확인'의 "
-                f"누락 목록을 보완해 다시 올려주세요. (항목별 상세는 생략)")
+                f"> ⚠ **이 중 {len(no_reply)}건은 AI가 판정을 회신하지 못한 것입니다"
+                f"(시간 제한·모델 실행 실패) — 서류 문제가 아닙니다.** 잠시 후 같은 "
+                f"파일로 다시 시도해 주세요. 반복되면 관리자에게 알려주세요.")
+            lines.append("")
+        if total_items and judged >= max(8, int(total_items * 0.7)):
+            lines.append(
+                f"> 점검 항목 {total_items}개 중 {judged}개는 이 문서만으로는 판단할 수 "
+                f"없었습니다. 대개 **판단에 필요한 서류(산출내역서·사업계획서 등)가 빠진 "
+                f"경우**입니다 — 위 '서류 완결성 확인'의 누락 목록을 보완해 다시 올려주세요. "
+                f"(항목별 상세는 생략)")
+            lines.append("")
+        elif judged and len(unable) >= max(8, int(total_items * 0.7)):
+            lines.append(f"> 나머지 {judged}건은 문서에 판단 근거가 없어 확인이 필요합니다. (항목별 상세는 생략)")
             lines.append("")
         else:
             for axis, it in unable:
