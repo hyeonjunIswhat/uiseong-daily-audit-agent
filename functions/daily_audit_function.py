@@ -127,7 +127,10 @@ def _parse_one_attachment(name: str, path: str) -> dict:
                     + (" — " + "; ".join(c.expr for c in bad[:2]) if bad else ""))
             notes = [f"  · ℹ {n}" for n in r.notes]
             total = next((c for c in r.checks if c.kind == "fp_total"), None)
+            direct = next((c for c in r.checks if c.kind == "fp_direct_total"), None)
+            direct_items = [c.expr for c in r.checks if c.kind == "fp_direct_item"]
             return {"kind": "cost", "name": name, "cost_lines": [line] + notes, "total": total,
+                    "sheet": sheet, "direct": direct, "direct_items": direct_items,
                     "evidence": f"🧮 [자동 계산] `{name}`" + (f" 시트 '{sheet}'" if sheet else "")
                                 + f" — 산식 {len(r.checks)}건을 검산해 불일치 {len(bad)}건을 확인했습니다"
                                 + (f" (예: {bad[0].expr[:50]})" if bad else "")}
@@ -247,6 +250,7 @@ class Pipe:
         # ── 1차 즉시 사전점검(LLM 미관여) — 파일을 읽는 족족 실제 근거를 내보낸다
         # ("파일을 확인했습니다" 같은 추상 문구 금지 — 파일명·글자수·검산 결과로 말한다)
         filenames, cost_lines, extra_parts, skipped, attach_texts = [], [], [], [], []
+        cost_results: list[dict] = []   # xlsx 검산 상세(직접경비 규칙용)
         bundle_profiles = []            # 파일별 사업 프로파일(첨부 시에만 채움)
         prep_evidence: list[str] = []   # 15초 안내용 '마지막 확인 근거'
         if files:
@@ -262,6 +266,7 @@ class Pipe:
                 if r["kind"] == "text":
                     attach_texts.append((r["name"], r["text"]))
                 elif r["kind"] == "cost":
+                    cost_results.append(r)
                     cost_lines += r["cost_lines"]
                     if r["total"]:
                         extra_parts.append(DocPart(f"{name}(검산 총액)",
@@ -391,13 +396,34 @@ class Pipe:
         if preface:
             parts.append(preface)
         comp_missing: list[str] = []
+        evidence_docs = None
         try:
             comp = RequiredDocs().check(doc, method=method, biz_type=biz_type or group,
                                         filenames=filenames)
             comp_missing = [lb for _k, lb, _h in comp.missing]
             parts.append(format_completeness(comp))
+            # 검토 근거로 쓸 수 있는 서류 = 텍스트 실물이 있는 인식만(스캔 PDF·
+            # 본문 언급뿐인 서류는 내용 검토가 불가하므로 제외 — EVIDENCE_MISSING 기준)
+            text_names = [n for n, _t in attach_texts]
+            ev_hits = RequiredDocs().detect(doc, filenames=text_names)
+            evidence_docs = {h.key for h in ev_hits
+                             if "첨부되지 않았습니다" not in h.source}
+            if cost_lines:
+                evidence_docs.add("산출내역서")
         except Exception:
             pass  # 완결성 확인 실패가 검토를 막으면 안 됨
+
+        # 직접경비 산출근거 결정론 규칙(2026-07-15 정답 사례 일반화 — 시행규칙§7,
+        # 루브릭 B7의 '첨부 존재' 판정은 모델이 아니라 규칙 몫): 산출내역서에
+        # 직접경비가 계상돼 있는데 산출근거 서류(견적서·가격자료)가 없으면 지적.
+        det_notes: list[str] = []
+        for r0 in cost_results:
+            if r0.get("direct") and r0["direct"].claimed > 0                     and not any(("견적" in n) or ("가격" in n) for n in filenames):
+                items = " · ".join(i.split(":")[0] for i in r0.get("direct_items", [])[:4])
+                det_notes.append(
+                    f"직접경비 {int(r0['direct'].claimed):,}원({items})이 계상되어 있으나 "
+                    f"산출근거 서류(견적서·가격자료)가 첨부되지 않음 — `{r0['name']}` "
+                    f"시트 '{r0.get('sheet', '')}'")
 
         # 1차(자동 확인) 부분 결과를 즉시 스트리밍 — 이후 단계가 실패해도 이 결과는 남는다
         yield "\n" + mask_pii("\n\n".join(parts)) + "\n\n"
@@ -457,17 +483,19 @@ class Pipe:
                     orch.written_review, group, doc,
                     progress=progress, doc_profile=profile, contract_method=method,
                     doc_parts=doc_parts, llm_doc_text=llm_doc, should_stop=should_stop,
+                    evidence_docs=evidence_docs, extra_rule_notes=det_notes,
                 )
                 render = (format_user_summary(wr, missing_docs=comp_missing)
                           + "\n\n" + format_written_review(wr))
-                return orch, render, wr.ref_tags
+                return orch, render, wr.ref_tags, wr.report
             report = await asyncio.to_thread(
                 orch.self_check, group, doc,
                 progress=progress, doc_profile=profile, contract_method=method,
                 doc_parts=doc_parts, llm_doc_text=llm_doc, should_stop=should_stop,
+                evidence_docs=evidence_docs, extra_rule_notes=det_notes,
             )
             return orch, format_self_check(report), orch.tags.classify_all(
-                sorted(set(report.law_context_used)))
+                sorted(set(report.law_context_used))), report
 
         task = asyncio.create_task(_run())
         task.add_done_callback(lambda _t: q.put_nowait(_DONE))
@@ -497,7 +525,7 @@ class Pipe:
                 yield (f"\n⚠ AI 검토 중 오류: {err}\n위에 표시된 1차(자동 확인) 결과까지는 "
                        "유효합니다. 다시 시도하거나 담당자에게 문의하세요.")
                 return
-            orch, render, ref_tags = task.result()
+            orch, render, ref_tags, report_obj = task.result()
         except GeneratorExit:
             # 사용자가 응답 생성을 중단 — 진행 스레드를 멈추고 늦은 이벤트를 폐기
             state["cancelled"] = True
@@ -508,6 +536,20 @@ class Pipe:
             if hb:
                 hb.cancel()
 
+        # 판정 원인 추적(운영 로그, 항목 id·코드만 — 원문 미기록): 로직/모델 문제 구분
+        try:
+            from audit_core.orchestrator import unable_causes
+            causes = unable_causes(report_obj)
+            n_ok = sum(1 for ar in report_obj.axis_results for it in ar.items if it.verdict == "OK")
+            _agent_log(f"▷ 판정 추적 ok={n_ok} flag={len(report_obj.flags())} "
+                       f"ev_missing={len(causes['EVIDENCE_MISSING'])} "
+                       f"judged_unable={len(causes['JUDGED_UNABLE'])} "
+                       f"no_reply={len(causes['NO_REPLY'])} det_notes={len(report_obj.det_notes)}")
+            for cause, items in causes.items():
+                if items:
+                    _agent_log(f"  · {cause}: {','.join(it.item_id for _a, it in items)}")
+        except Exception:
+            pass
         await self._emit_citations(emitter, orch, ref_tags)
         total = int(time.time() - state["t0"])
         await self._status(

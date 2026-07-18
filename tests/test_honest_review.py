@@ -103,12 +103,45 @@ class TestHonestNarration(unittest.TestCase):
         # 리포트도 모델 실패를 서류 부족으로 설명하지 않는다
         text = format_self_check(report)
         self.assertIn("서류 문제가 아닙니다", text)
-        self.assertIn("판정을 회신하지 못한", text)
+        self.assertIn("판정을 받지 못했습니다", text)
+        self.assertIn("AI 미회신", text)
 
     def test_ok_verdicts_still_say_clean(self):
         _report, msgs = self._run(_AllOkClient())
         axis_done = [m for m in msgs if "검토를 마쳤습니다" in m]
         self.assertTrue(all("이상 없습니다 ✓" in m for m in axis_done))
+
+
+class TestEvidenceMissing(unittest.TestCase):
+    def test_axis_without_required_docs_is_premarked_not_sent_to_llm(self):
+        sent_ids = []
+
+        class Spy(_AllOkClient):
+            def chat_json(self, *, model, prompt, schema, **kw):
+                sent_ids.extend(re.findall(r"^- ([A-Za-z0-9]\w*(?:-\d+)?): ", prompt, re.M))
+                return super().chat_json(model=model, prompt=prompt, schema=schema, **kw)
+
+        orch = Orchestrator(reviewer=AxisReviewer(client=Spy()), rubric=Rubric(),
+                            law_fetcher=_NoLaw())
+        # 산출내역서 없음 → 축2(타당성·원가) 항목은 사전 분류·LLM 미투입
+        report = orch.self_check("물품", DOC, evidence_docs={"규격서", "일상감사요청서"})
+        from audit_core.orchestrator import unable_causes
+        causes = unable_causes(report)
+        ev = causes["EVIDENCE_MISSING"]
+        self.assertTrue(ev)                       # 축2 항목들이 근거 미첨부로 분류
+        ev_ids = {it.item_id for _a, it in ev}
+        self.assertFalse(ev_ids & set(sent_ids))  # LLM에 보내지 않음
+        text = format_self_check(report)
+        self.assertIn("필요 서류 없음", text)
+        self.assertIn("산출내역서", text)          # 무엇이 없는지 명시
+        self.assertIn("단가·수량·산식", text)      # 무엇을 확인 못 하는지 명시
+
+    def test_without_evidence_info_behavior_unchanged(self):
+        orch = Orchestrator(reviewer=AxisReviewer(client=_AllOkClient()), rubric=Rubric(),
+                            law_fetcher=_NoLaw())
+        report = orch.self_check("물품", DOC)      # evidence_docs=None → 사전 분류 없음
+        from audit_core.orchestrator import unable_causes
+        self.assertFalse(unable_causes(report)["EVIDENCE_MISSING"])
 
 
 class TestPerDocDigest(unittest.TestCase):

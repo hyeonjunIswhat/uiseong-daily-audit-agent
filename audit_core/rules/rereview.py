@@ -43,11 +43,31 @@ class ReReview:
         return len(self.added) + len(self.removed)
 
 
+def _doc_type_key(p: DocPart, catalog) -> str:
+    """버전 쌍 그룹 키 — 문서유형(표제 기반 카탈로그 키) 우선, 없으면 라벨.
+
+    실장애(2026-07-18, 테스트 B): 파일 첨부는 DocPart 라벨이 파일명이라
+    "4. 제안요청서.hwpx"와 "제안요청서 260323.hwpx"가 같은 유형으로 안 묶여
+    재심사 diff가 발동하지 않았다 — 표제 줄로 유형을 읽어 묶는다.
+    """
+    for ln in p.text.splitlines()[:40]:
+        hit = catalog.title_line_key(ln.strip()) if ln.strip() else None
+        if hit:
+            return hit[0]
+    return p.label.split("#")[0]
+
+
 def _version_pair(parts: list[DocPart]) -> tuple[DocPart, DocPart] | None:
-    """같은 유형 문서 2벌(라벨 X와 X#2) — 앞선 것을 직전본, 뒤를 개정본으로 본다."""
+    """같은 유형 문서 2벌 — 앞선 것을 직전본, 뒤를 개정본으로 본다(첨부 순서)."""
+    from audit_core.rules.completeness import RequiredDocs
+    try:
+        catalog = RequiredDocs()
+    except Exception:
+        catalog = None
     by_base: dict[str, list[DocPart]] = {}
     for p in parts:
-        by_base.setdefault(p.label.split("#")[0], []).append(p)
+        key = _doc_type_key(p, catalog) if catalog else p.label.split("#")[0]
+        by_base.setdefault(key, []).append(p)
     for group in by_base.values():
         if len(group) >= 2:
             return group[0], group[-1]
